@@ -233,9 +233,10 @@ def _parse_file_record(frn: int, raw: bytes) -> MftEntry | None:
         elif attr_type == 0x10 and not mtime:  # $STANDARD_INFORMATION
             content_off = struct.unpack_from("<H", attr, 0x14)[0]
             mtime = struct.unpack_from("<Q", attr, content_off + 0x08)[0]  # LastModificationTime
-        elif attr_type == 0x80 and not size and non_resident and attr[9] == 0:
-            # 只取 unnamed 主数据流(namelen==0);named 流(如 Zone.Identifier)不是文件大小
-            size = struct.unpack_from("<Q", attr, 0x30)[0]  # RealSize (EndOfFile)
+        elif attr_type == 0x80 and not size and attr[9] == 0:
+            # 只取 unnamed 主数据流(namelen==0);named 流(如 Zone.Identifier)不是文件大小。
+            # 驻留:ValueLength@0x10 就是实际字节数;非驻留:RealSize@0x30
+            size = struct.unpack_from("<H", attr, 0x10)[0] if not non_resident else struct.unpack_from("<Q", attr, 0x30)[0]
     aliases: list[tuple[int, str]] = []
     for prent, ns, cand in fn_list:
         if name is None or (name_ns == 2 and ns != 2):

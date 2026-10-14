@@ -76,6 +76,59 @@ def make_data_attribute_nonresident(real_size):
     return attr
 
 
+def make_data_attribute_resident(content):
+    """$DATA(驻留,unnamed):ValueLength@0x10 = 文件实际字节数。"""
+    return _resident_header(0x80, content)
+
+
+class TestResidentDataSize:
+    def test_resident_data_size(self):
+        # 正例:小文件内容驻留在 MFT 记录里,size = ValueLength(内容字节数)
+        content = b"hello resident data"
+        attrs = make_si_attribute(134_500_000_000_000_000) + make_fn_attribute(5, "small.txt") + make_data_attribute_resident(content)
+        rec = make_file_record(attributes=attrs)
+        entry = ntfs._parse_file_record(7, rec)
+        assert entry is not None
+        assert entry.size == len(content)
+        # 正例:小文件内容驻留在 MFT 记录里,size = ValueLength(内容字节数)
+        content = b"hello resident data"
+        attrs = make_si_attribute(134_500_000_000_000_000) + make_fn_attribute(5, "small.txt") + make_data_attribute_resident(content)
+        rec = make_file_record(attributes=attrs)
+        entry = ntfs._parse_file_record(7, rec)
+        assert entry is not None
+        assert entry.size == len(content)
+    def test_named_resident_data_ignored(self):
+        # 反例:named 驻留 $DATA 流(如 Zone.Identifier)不算文件大小 → size 保持 0
+        content = b"[ZoneTransfer]\nZoneId=3\n"
+        named = _resident_header(0x80, content)
+        # namelen 写进 attr 头 0x09 + 名字本体;头格式 <IIBBHHHIH> 的第 4 字节是 name_len 位置... 按真实布局重排
+        head = struct.pack("<IIBBHHHIH", 0x80, 0x18 + len(b"name") + len(content), 0, 0, 0, 0, 0, len(content), 0x18)
+        head = bytearray(head)
+        head[8] |= 0  # resident
+        name_len = 16  # "Zone.Identifier" 15 字符 + nul? 实际取名任意;只需 namelen != 0
+        head[9] = name_len
+        named = bytes(head) + b"\x00\x00" + "zonnamed".encode("utf-16-le")[: name_len * 2] + content
+        attrs = make_fn_attribute(5, "small.txt") + named
+        rec = make_file_record(attributes=attrs)
+        entry = ntfs._parse_file_record(7, rec)
+        assert entry is not None
+        assert entry.size == 0
+
+    def test_named_nonresident_size_ignored(self):
+        # 反例(既有语义):named 非驻留流的 RealSize 不生效。
+        # 构造:name_len 放头 0x09,名字本体放 0x40 起,runs 在名字之后。
+        name = "wsl".encode("utf-16-le")  # 6 字节
+        attr = bytearray(struct.pack("<IIBBHHHIH", 0x80, 0x40 + len(name) + 1, 1, len(name) // 2, 0, 0, 0, 0, 0x40 + len(name)))
+        attr += struct.pack("<QQ", 0, 0)                                   # 0x10 VCN 范围
+        attr += struct.pack("<HHI", 0x40 + len(name), 0, 0)                # 0x20 runs offset, 0x22 compression, 0x24 padding
+        attr += struct.pack("<QQQ", 999, 999, 999)                         # 0x28/0x30/0x38 alloc/real/init
+        attr += name                                                        # 0x40 名字
+        attr += b"\x00"                                                     # 空 runs 终止
+        rec = make_file_record(attributes=make_fn_attribute(5, "f.txt") + bytes(attr))
+        entry = ntfs._parse_file_record(7, rec)
+        assert entry is not None and entry.size == 0
+
+
 class TestUsaFixup:
     def test_valid_record_passes(self):
         rec = bytearray(make_file_record())

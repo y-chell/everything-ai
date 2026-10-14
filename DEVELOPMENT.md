@@ -34,6 +34,13 @@
 - **根因**:一条 MFT 记录可以有多个 $DATA 属性(unnamed 主流 + named 流如 `Zone.Identifier`),只取第一个会拿到 named 流。
 - **修复**:只取 `NameLength == 0`(attr 头 offset 0x09)的非驻留 $DATA。
 
+### 小文件 size 全是 0(resident $DATA 被跳过)
+
+- **现象**:大文件对拍全绿(`size:>500mb` 一致),但 MCP 实测 `ext:py path:...` 结果里所有 .py 文件 size=0——这些文件明明有 16KB 内容。
+- **根因**:`size:>500mb` 的对拍只覆盖非驻留 $DATA(RealSize@0x30)。小于几 KB 的文件,NTFS 把内容直接存在 MFT 记录里(resident $DATA),这种属性头没有 RealSize 字段,原解析直接跳过 → size=0。全盘约 30 万小文件受影响。
+- **修复**:resident $DATA 的字节数 = 属性头 0x10 的 ValueLength;按 resident/non-resident 分支取样。
+- **教训**:对拍查询要覆盖两类数据形态(`size:>500mb` 只打得中非驻留);常驻 MCP 进程不会热加载磁盘上的新代码——修完必须重启 server 并重建索引,实测才能确认。
+
 ## FRN 树(最坑的一节)
 
 ### 全盘记录号 off-by-one,树整体断裂
