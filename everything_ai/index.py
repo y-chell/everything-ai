@@ -24,8 +24,15 @@ def _recnum(frn: int) -> int:
     """FRN → 记录号(低 48 位)。根判断/树遍历只看记录号。"""
     return frn & ROOT_RECNUM_MASK
 
-# AGENTS.md 硬性要求:结果排除该目录(递归读取会触发荣耀手机同步下载)
-EXCLUDED_PATH_PREFIXES = ("c:\\users\\administrator\\crossdevice",)
+def _parse_excluded_prefixes(raw: str) -> tuple[str, ...]:
+    """EVERYTHING_AI_EXCLUDE 解析:分号分隔的路径前缀,归一小写,忽略空段。"""
+    return tuple(p.strip().lower() for p in raw.split(";") if p.strip())
+
+
+# 可选配置:设环境变量 EVERYTHING_AI_EXCLUDE(分号分隔、大小写不敏感)后,
+# 匹配前缀的路径会从结果中剔除——用于把"agent 拿到路径后递归读取会有副作用"的
+# 目录(如被手机同步软件托管的目录,读取会触发云端下载)挡在结果之外。
+EXCLUDED_PATH_PREFIXES = _parse_excluded_prefixes(os.environ.get("EVERYTHING_AI_EXCLUDE", ""))
 
 
 @dataclass

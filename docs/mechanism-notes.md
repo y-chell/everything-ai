@@ -1,6 +1,6 @@
 # Everything 1.4.1.1032 (x64) 机制逆向笔记
 
-分析对象:`E:\小工具\Everything-1.4.1.1032.x64\everything.exe`(2.27MB,PE64)
+分析对象:everything.exe 1.4.1.1032(x64,2,272,424 字节,PE64)
 工具:IDA Professional 9.5 (ida-mcp) + voidtools 官方论坛(作者 void 回复)交叉验证
 日期:2026-10-14
 

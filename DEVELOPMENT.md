@@ -98,5 +98,5 @@
 
 ## 工程集成
 
-- **DSH 新增 MCP server 需重启应用**才随启动拉起(改 `cordis.patch.yml` 后不重启不生效)。
+- **MCP client 新增 server 需重启应用**才随启动配置拉起(改注册配置后不重启不生效)。
 - MCP server 的索引构建放后台线程,`initialize` 握手不阻塞;`search` 在索引未就绪时返回状态而不是挂起。

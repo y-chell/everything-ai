@@ -5,6 +5,7 @@
 差异容忍:建索引与查询之间文件系统可能漂移,报告差异数量与样例。
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -12,7 +13,8 @@ import time
 from everything_ai.index import EXCLUDED_PATH_PREFIXES, FileIndex
 from everything_ai.query import compile_query
 
-ES_EXE = r"E:\小工具\Everything-1.4.1.1032.x64\es.exe"
+# es.exe 路径:默认从 PATH 找,或用环境变量 ES_EXE 指定完整路径
+ES_EXE = os.environ.get("ES_EXE", "es.exe")
 
 QUERIES = [
     "everything.exe",

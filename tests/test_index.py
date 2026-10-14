@@ -3,7 +3,7 @@
 import pytest
 
 from everything_ai import ntfs
-from everything_ai.index import ROOT_FRN, Entry, VolumeIndex
+from everything_ai.index import ROOT_FRN, Entry, VolumeIndex, _parse_excluded_prefixes
 
 
 def make_usn_record(frn, parent, name, reason, ts=1000, attrs=0x20):
@@ -104,3 +104,14 @@ class TestUsnReplay:
         )
         assert vol.entries[11].name == "reborn.txt"
         assert vol.entries[11].parent_frn == 12
+
+
+class TestExcludedPrefixes:
+    def test_parse_prenormalized(self):
+        # 正例:分号分隔,大小写归一,去空白(含尾部反斜杠前缀)
+        assert _parse_excluded_prefixes("C:\\Foo\\Bar; D:\\Baz\\") == ("c:\\foo\\bar", "d:\\baz\\")
+
+    def test_parse_empty_and_blank_segments(self):
+        # 反例:空串与仅空段的输入 → 无排除
+        assert _parse_excluded_prefixes("") == ()
+        assert _parse_excluded_prefixes(";;   ;;") == ()

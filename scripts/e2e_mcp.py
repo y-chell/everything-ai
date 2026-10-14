@@ -63,9 +63,9 @@ def main():
             print("   ", item["path"])
 
         send(proc, {"jsonrpc": "2.0", "id": 101, "method": "tools/call", "params": {
-            "name": "search", "arguments": {"query": "everything.exe path:小工具", "max_results": 3}}})
+            "name": "search", "arguments": {"query": "everything.exe path:bin", "max_results": 3}}})
         r = json.loads(recv(proc, 101)["result"]["content"][0]["text"])
-        print(f"search everything.exe path:小工具 -> total={r['total_matched']}")
+        print(f"search everything.exe path:bin -> total={r['total_matched']}")
         for item in r["results"][:3]:
             print("   ", item["path"], item["size"], item["modified"])
 
