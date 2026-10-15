@@ -107,3 +107,104 @@
 
 - **MCP client 新增 server 需重启应用**才随启动配置拉起(改注册配置后不重启不生效)。
 - MCP server 的索引构建放后台线程,`initialize` 握手不阻塞;`search` 在索引未就绪时返回状态而不是挂起。
+
+## 查询层重构(2026-10-15)
+
+把查询从"每条记录调一次 Python 闭包 matcher"改成"分阶段过滤 + 有界堆"。这轮全部结论都来自实测,不来自推理——下面每条都附了实测数字,因为它们和直觉不一致。
+
+### 先用数据否决掉三个"看起来很美"的方案
+
+- **每项一次 `re.search`**:335 ns/项,比 `needle in name` 的 56 ns 慢 6 倍。正则只在 C 层快,每次调用本身的固定开销在短文件名上完全不划算。**热路径不要用正则。**
+- **所有名字拼成一个大 blob,用带前瞻的整块正则一次扫完**:2191 ns/项(3.4 s),比逐项还慢 40 倍。`(?=[^\n]*a)[^\n]*\n` 这类前瞻在每个起点都要重扫一次行,退化成平方级。**整块扫描在 Python 里不成立。**
+- **多条件合并成一个前瞻正则**(`(?=.*a)(?=.*b)`):10915 ns/项。同上。
+
+相反,`list[str]` 上做 `[i for i, x in enumerate(names) if needle in x]` 是 57-79 ns/项,这才是 Python 里最快的形状。
+
+### `iter_items()` 的生成器本身就是最大开销
+
+旧实现 `for drive, frn, e, path in index.iter_items()` 空转(什么都不判)**588 ms / 158 万条 = 373 ns/项**,比 `list(entries.items())` 的 127 ns 高 3 倍——多出来的是 `dict.get` + 生成器 yield + 元组拆包。而真正做子串判断只要 57 ns。**迭代骨架比判断本身贵 6 倍。**
+
+### 分阶段过滤:便宜的先跑,贵的只跑候选
+
+`path:system32 ext:dll`:先 `ext:dll` 整表筛出 5.7 万候选(106 ms),再在这 5.7 万上做路径匹配(21 ms),合计 127 ms;旧的全量 path+ext 扫描是 520 ms,再加闭包开销实际 2798 ms。
+
+实现要点(见 `query.py` 的 `Plan` / `Stage`):
+
+- 只有顶层 AND 链上的条件可拆成阶段;`or` / `not` / 正则 / 路径条件整体退化成 `Full` 阶段,代价最高、排最后。
+- 代价序:`NameContains`(0) < `ExtIn`(1) < `SizeCmp`(2) < `MtimeRange`(3) < `NameExcludes`(4) < `Full`(5)。
+- 同代价内**最长的子串先测**(WinShun `NameMatcher` 同款):它拒绝的名字最多。
+- 通配型取最长字面片段做预筛;**模式里含 `[` 时直接放弃预筛**——`fnmatch` 把 `[abc]` 当字符类,此时任何片段都不是必要条件,预筛会漏结果。
+- `!词` 走 `NameExcludes` 阶段(排除条件不缩小候选集,所以排在收窄阶段之后)。
+
+### `ExtIn` 少了"目录不算有扩展名"
+
+- **现象**:分阶段求值的 `ext:git` 返回了 `.git` 目录,暴力实现返回 0 条,新增的对拍测试立刻红。
+- **根因**:原来的 `_ext_matcher` 里写着 `if is_dir: return False`,重写成阶段时只照抄了 `endswith`。
+- **修复**:`ExtIn` 的 `scan`/`filter` 都加 `not (flags[i] & FLAG_DIR)`。
+- **教训**:把闭包拆成阶段时,闭包里**所有**分支都要过一遍,尤其是不显眼的早退。同一次重构里 `TestStagedEqualsBruteForce` 的 90 组(查询 × kind)参数化用例是唯一能抓住它的东西。
+
+### 单表按 FRN 打"死亡标记"会误杀自己刚写的新行
+
+USN 增量最初的做法是"把变更过的 FRN 记进 `dead` 集合,查询时跳过"。它必然错两种情况:
+
+1. **新建文件**:FRN 被标死,随后为它追加的新行也被同一个 FRN 过滤掉;
+2. **删除后重建同一 FRN**:DELETE 标死之后再 CREATE,新行照样被滤掉。
+
+- **修复**:分**基表 + 增量表**两张。基表(full build 时定稿)按 FRN 失效,增量表按 FRN **就地覆盖**且永不失效。重复的 DATA_CHANGE 因为覆盖在同一个行号上,不会堆重复行。
+- **顺带**:碎片回收阈值除了绝对值,还用了"失效行占比 > 1/4",但**必须加行数下限**——小表(测试里 9 行)上 3 行失效就触发全量重建,反复重建把增量表压得只剩几百行。加了 `SCAN_COMPACT_FLOOR = 4096`。
+
+### `aliases` 表主键漏了 parent,冷热索引结果不一致
+
+- **现象**:冷建索引 `ext:py` 有 355,850 条命中,从 SQLite 恢复后只剩 101,439 条;总行数 274 万 vs 239 万。查询结果取决于"这次是不是刚重建过索引"。
+- **根因**:内存里已经按 **(parent, name) 对**去重硬链接别名(见上文"硬链接丢 1790 条路径"那条),但 `aliases` 表的 `PRIMARY KEY (volume, frn, name)` 少写了 parent——同一 FRN 下同名、不同父目录的别名(`WinSxS` 里全是这种)在 `INSERT OR IGNORE` 时被吞掉。
+- **修复**:主键改成 `(volume, frn, parent, name)`,`SCHEMA_VERSION` 提到 3。**内存层修完要检查持久化层的 key 是不是同一个。**
+- **教训**:这类"冷热不一致"只有把冷建的数和缓存后的数**放在一起比**才会暴露。单看任何一次跑都是自洽的。
+
+### 候选循环里最贵的两件事,都不该在循环里做
+
+实测 35.6 万候选,完整循环 **1259 ns/项**:
+
+| 环节 | 单独成本 |
+|---|---|
+| 数组下标取值 | 76 ns |
+| + `dir_path()`(目录路径查缓存) | 357 ns |
+| + 文件名拼接 | 517 ns |
+| + `_excluded()` | 183 ns |
+| + 排序键元组 | 332 ns |
+| + 构造 `Hit` 对象 | 470 ns |
+
+路径解析+拼接 ~440 ns、`Hit` 构造 ~470 ns,合计占七成,而最终只会用到 30-200 条。**修复**:循环里只产出"排序键 + `(vol, scan, 行号)`",路径解析和 `Hit` 构造推迟到选出分页之后(`_materialize`)。排序键里原本用完整路径做末位 tiebreak,改成文件名(更便宜且同样确定)。
+
+优化后 `ext:py` 从 1051 ms 降到 455 ms。
+
+### 别用 tracemalloc 测加载耗时
+
+带 `tracemalloc.start()` 测出的加载是 **37.5 s**,去掉之后是 **16.8 s**。tracemalloc 会 hook 每一次分配,而加载路径全是分配(220 万个 `Entry`)。**测时间就不要开 tracemalloc;要测内存就单独跑一次。**
+
+### `pending_changes` 的记账位置
+
+`pending_changes` 的更新必须放在 `_apply_scan_delta` 里 `if self.scan is None: return` 这个早退**之前**。内存里还没建扫描表时(比如刚 `build_from_mft` 前的路径)也得记账,否则这些变更永远不会落盘,重启后又得靠 USN 重放补。
+
+### USN 记录里没有文件大小,新建的文件 size 恒为 0
+
+- **现象**:索引 size 抽检 E: 卷的 4846 个 `.py`,225 个(4.6%)索引里是 0、磁盘上不是;`everything_ai\index.py` 索引 0 字节、实际 26 KB。
+- **根因**:`USN_RECORD` **不带文件大小**。只有 `FSCTL_ENUM_USN_DATA` / 手动解析 $MFT 才拿得到 `$DATA` 的 RealSize。旧的 USN 回放对 CREATE 写 `Entry(..., size=0, ...)`,对 DATA_CHANGE 只更新 mtime——注释里写的"USN 不带新 size,保持旧值"对**已存在的**文件是对的,对**新建的**文件就永远是 0。
+- **影响**:agent 写文件 → 立刻能搜到,但拿到的 size 是 0,`size:` 查询也打不中它。恰好吃掉这次刚接上的"实时增量"的全部好处。
+- **修复**:同一批 USN 里凡是 CREATE 或 DATA_CHANGE 且不是目录的 FRN,回读磁盘补 `size`/`mtime`(mtime 只向前推)。
+- **第一次修错了**:给这轮回读加了单批上限 `USN_STAT_MAX = 2000`,想防批量解压。结果抽样对拍里仍有 244/1599 条 `idx=0`——因为 `read_usn_changes` 一次就把积压的 USN 全部读完(**一个批次 = 全部积压**),上限只是把超出部分**静默丢掉**,而 USN 检查点已经前进,这些文件之后再也不会出现在 USN 里,size 永久停在 0。**用上限截断"必须处理完的补偿动作"等于数据丢失**;要限流就得把检查点退回到最后一个完整处理的位置,否则不许截断。
+- **顺带**:`SCHEMA_VERSION` 提到 5 强制重建,否则库里已经写坏的 size=0 行会一直留着。
+- **教训**:增量路径的字段完备性要逐个核对"这个事件带不带这个字段"。`entries` 里 `size` 有两个来源(全量解析 / 增量回放),两条路径必须都能填对。
+
+### 抽样对拍要覆盖到"字段值",不能只对"命中条数"
+
+上面两个 bug(别名被落盘吞掉、size 恒为 0)都不会让查询报错,也都不会让"命中条数对拍"失败——它们只让**字段值**错。`scripts/bench_search.py` 现在除了逐条 matcher 的条数对拍,还抽样比对索引里的 size 与 `os.stat`,这一类才算真正盖住。
+
+### `path_scope` 前缀比较要补分隔符
+
+`C:\proj` 直接做 `startswith` 会把 `C:\project\...` 也命中。补一个尾部 `\` 再比(`scope_l = path.rstrip("\\/").lower() + "\\"`),并补一组"`proj` 不能命中 `project`"的用例。
+
+### 有变更就整表重写 SQLite
+
+`build_all` / `refresh_if_stale` 原本在 `changed` 时调 `_save_volume`(`DELETE` + 重插全表)。三卷 220 万条下,启动只要有一卷有 USN 变更就要重写整个库,占掉启动时间的一半以上(16.8 s → 36.3 s 的差别就来自这里)。
+
+**修复**:`VolumeIndex.pending_changes` 记录自上次落盘以来变过的 FRN,`_save_delta` 只 upsert/delete 这些 FRN 的行,并顺带推进 `meta.next_usn`。全量 `build_from_mft` 仍然走 `_save_volume`。`pending_changes` 的更新要放在 `_apply_scan_delta` 的 `scan is None` 早退**之前**——内存里还没建扫描表时也得记账,否则这些变更永远不会落盘。
