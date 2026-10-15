@@ -47,6 +47,7 @@ USN_REASON_RENAME_NEW_NAME = 0x00002000
 USN_REASON_CLOSE = 0x80000000
 
 FILE_ATTRIBUTE_DIRECTORY = 0x10
+FILE_ATTRIBUTE_HIDDEN = 0x02
 
 FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
@@ -196,6 +197,7 @@ class MftEntry:
     base_frn: int       # 非 0 = attribute list 扩展记录,指向 base 记录
     aliases: tuple[tuple[int, str], ...] = ()  # 其余 $FN(硬链接),(parent_recnum, name)
     name_ns: int = -1   # 主名 namespace(0=POSIX 1=Win32 2=DOS 3=Win32+DOS)
+    hidden: bool = False  # $STANDARD_INFORMATION.FileAttributes & FILE_ATTRIBUTE_HIDDEN
 
 
 def _parse_file_record(frn: int, raw: bytes) -> MftEntry | None:
@@ -218,6 +220,7 @@ def _parse_file_record(frn: int, raw: bytes) -> MftEntry | None:
     parent = 0
     size = 0
     mtime = 0
+    hidden = False
     fn_list: list[tuple[int, int, str]] = []  # (parent_recnum, ns, name)
     for attr_type, _attr_len, attr in _iter_attributes(bytes(rec)):
         non_resident = attr[8] & 1
@@ -230,9 +233,13 @@ def _parse_file_record(frn: int, raw: bytes) -> MftEntry | None:
                 continue
             cand = content[0x42: 0x42 + name_len * 2].tobytes().decode("utf-16-le", errors="replace")
             fn_list.append((struct.unpack_from("<Q", content, 0)[0] & 0x0000FFFFFFFFFFFF, ns, cand))
-        elif attr_type == 0x10 and not mtime:  # $STANDARD_INFORMATION
+        elif attr_type == 0x10:  # $STANDARD_INFORMATION
             content_off = struct.unpack_from("<H", attr, 0x14)[0]
-            mtime = struct.unpack_from("<Q", attr, content_off + 0x08)[0]  # LastModificationTime
+            if not mtime:
+                mtime = struct.unpack_from("<Q", attr, content_off + 0x08)[0]  # LastModificationTime
+            if not hidden:
+                attrs = struct.unpack_from("<I", attr, content_off + 0x20)[0]  # FileAttributes
+                hidden = bool(attrs & FILE_ATTRIBUTE_HIDDEN)
         elif attr_type == 0x80 and not size and attr[9] == 0:
             # 只取 unnamed 主数据流(namelen==0);named 流(如 Zone.Identifier)不是文件大小。
             # 驻留:ValueLength@0x10 就是实际字节数;非驻留:RealSize@0x30
@@ -249,7 +256,7 @@ def _parse_file_record(frn: int, raw: bytes) -> MftEntry | None:
         elif ns != 2 and (prent, cand) != (parent, name):
             # 硬链接同名不同目录:按 (parent, name) 对去重,不能只比名字
             aliases.append((prent, cand))
-    return MftEntry(frn, parent, name, bool(flags & 2), size, mtime, base_frn, tuple(aliases), name_ns)
+    return MftEntry(frn, parent, name, bool(flags & 2), size, mtime, base_frn, tuple(aliases), name_ns, hidden)
 
 
 def _merge_extended(ext: MftEntry, base: MftEntry) -> None:
@@ -276,6 +283,8 @@ def _merge_extended(ext: MftEntry, base: MftEntry) -> None:
         base.size = ext.size
     if ext.mtime_ft > base.mtime_ft:
         base.mtime_ft = ext.mtime_ft
+    if ext.hidden:
+        base.hidden = True
 
 
 def ns_ok(name: str) -> bool:

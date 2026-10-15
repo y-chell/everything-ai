@@ -48,9 +48,9 @@ def _resident_header(attr_type, content: bytes) -> bytes:
     return head + b"\x00\x00" + content  # 0x16-0x17 reserved
 
 
-def make_si_attribute(mtime_ft):
-    """$STANDARD_INFORMATION(resident):ModificationTime @ content+0x08。"""
-    content = struct.pack("<QQQQI", 0, mtime_ft, 0, 0, 0x20)
+def make_si_attribute(mtime_ft, file_attributes=0x20):
+    """$STANDARD_INFORMATION(resident):ModificationTime @ content+0x08,FileAttributes @ +0x20。"""
+    content = struct.pack("<QQQQI", 0, mtime_ft, 0, 0, file_attributes)
     return _resident_header(0x10, content)
 
 
@@ -212,6 +212,18 @@ class TestFileRecordParsing:
         rec = make_file_record(flags=1, base_frn=0x1234, attributes=attrs)
         entry = ntfs._parse_file_record((200 << 48) | 2, rec)
         assert entry.base_frn == 0x1234
+
+    def test_hidden_from_standard_information(self):
+        # 正例:$SI.FileAttributes 带 FILE_ATTRIBUTE_HIDDEN(0x02)
+        attrs = make_si_attribute(134_500_000_000_000_000, 0x22) + make_fn_attribute(5, "desktop.ini")
+        entry = ntfs._parse_file_record(7, make_file_record(attributes=attrs))
+        assert entry is not None and entry.hidden is True
+
+    def test_not_hidden_without_flag(self):
+        # 反例:只有 ARCHIVE(0x20),不能误判成隐藏
+        attrs = make_si_attribute(134_500_000_000_000_000, 0x20) + make_fn_attribute(5, "readme.txt")
+        entry = ntfs._parse_file_record(7, make_file_record(attributes=attrs))
+        assert entry is not None and entry.hidden is False
 
 
 class TestUsnRecordParsing:

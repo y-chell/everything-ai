@@ -11,7 +11,8 @@ import sys
 import time
 
 from everything_ai.index import EXCLUDED_PATH_PREFIXES, FileIndex
-from everything_ai.query import compile_query
+from everything_ai.query import compile_plan
+from everything_ai.search import run_search
 
 # es.exe 路径:默认从 PATH 找,或用环境变量 ES_EXE 指定完整路径
 ES_EXE = os.environ.get("ES_EXE", "es.exe")
@@ -53,15 +54,10 @@ def run_es(query: str, limit: int = 200000) -> set[str]:
 
 
 def run_ours(idx: FileIndex, query: str) -> set[str]:
-    matcher = compile_query(query)
-    paths = set()
-    for _drive, _frn, e, path in idx.iter_items():
-        low = path.lower()
-        if any(low.startswith(x) for x in EXCLUDED_PATH_PREFIXES):
-            continue
-        if matcher(e.name, path, e.size, e.mtime_ft, e.is_dir):
-            paths.add(path)
-    return paths
+    """走与 MCP search 完全相同的引擎,只把 limit 放到最大以拿全集。"""
+    plan = compile_plan(query)
+    out = run_search(idx, plan, kind="all", limit=1_000_000, include_system=True)
+    return {h.path for h in out.hits}
 
 
 def main():
